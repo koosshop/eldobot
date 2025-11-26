@@ -125,5 +125,11 @@ client.on('interactionCreate', async (interaction) => {
     await interaction.reply('Er is iets fout gegaan. Check bot console.');
   }
 });
+// debug (verwijder later) — toont alleen true/false, geen token
+console.log('ENV DEBUG — hasDISCORD:', !!process.env.DISCORD_TOKEN, 'hasBOT:', !!process.env.BOT_TOKEN);
+
+// prefer DISCORD_TOKEN, fallback op BOT_TOKEN (veilig)
+const TOKEN = process.env.DISCORD_TOKEN || process.env.BOT_TOKEN;
+client.login(TOKEN);
 
 client.login(process.env.BOT_TOKEN).catch(err => { console.error('Discord login mislukt:', err); process.exit(1); });
