@@ -1,37 +1,29 @@
-// bot.js (vervang je huidige bestand door deze versie)
-// Gebaseerd op je huidige bot (Sheets / health server etc.) maar uitgebreid met
-// register + getproxy commands die met de control-server praten.
-//
-// Verwacht: NODE env vars:
-//  - DISCORD_TOKEN (of BOT_TOKEN)  [reeds gebruikt door jouw oude bot]
-//  - CONTROL_SERVER (bv http://localhost:3000)
-//  - CONTROL_API_KEY (optioneel)
-
+// bot.js — complete vervanging (copy-paste)
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
+const http = require('http');
 const { Client, GatewayIntentBits, SlashCommandBuilder } = require('discord.js');
 const { google } = require('googleapis');
+
+// PIA control client (nieuw bestand: pia_control_client.js moet in dezelfde map staan)
 const { createTokenForDiscordUser, assignProxyByToken, listAgents } = require('./pia_control_client');
 
-// ---------- CONFIG (houd jouw bestaande Google/SHEET config) ----------
+// ---------- CONFIG (houd jouw bestaande Google/SHEET config indien van toepassing) ----------
 const CREDENTIALS_PATH = path.join(__dirname, 'google_oauth_credentials.json');
 const TOKEN_PATH = path.join(__dirname, 'token.json');
-const SPREADSHEET_ID = '1iFR1b3FQorkct4klp05DO7-R0XHRMLjmq1nvinoUU2k'; // behoud dit als je Sheets gebruikt
-const LOCAL_CSV_PATH = '/mnt/data/November_2025-invoice.csv';
-const DEFAULT_CALLBACK_PORT = 3000;
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID || '1iFR1b3FQorkct4klp05DO7-R0XHRMLjmq1nvinoUU2k'; // vervang naar wens
+const DEFAULT_CALLBACK_PORT = process.env.PORT || 3000;
 const SCOPES = ['https://www.googleapis.com/auth/spreadsheets'];
 // ---------------------------------------------------------------------
 
 const TOKEN = process.env.DISCORD_TOKEN || process.env.BOT_TOKEN || null;
-console.log('ENV DEBUG — hasDISCORD:', !!process.env.DISCORD_TOKEN, 'hasBOT:', !!process.env.BOT_TOKEN);
-
 if (!TOKEN) {
-  console.error('ERROR: Geen Discord token gevonden in environment. Zet DISCORD_TOKEN (of BOT_TOKEN) in Render/omgeving.');
+  console.error('ERROR: Geen Discord token gevonden in environment. Zet DISCORD_TOKEN (of BOT_TOKEN).');
   process.exit(1);
 }
 
-// Google auth (identiek aan jouw vorige file)
+// Google auth (optioneel — als je Sheets gebruikt)
 let oauth2Client = null;
 let sheets = null;
 if (fs.existsSync(CREDENTIALS_PATH)) {
@@ -42,13 +34,13 @@ if (fs.existsSync(CREDENTIALS_PATH)) {
     oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
     sheets = google.sheets({ version: 'v4', auth: oauth2Client });
   } catch (err) {
-    console.warn('Fout bij inlezen credentials:', err.message || err);
+    console.warn('Fout bij inlezen google_oauth_credentials.json:', err.message || err);
   }
 }
 
 async function ensureAuthenticated() {
   if (!oauth2Client) {
-    throw new Error('OAuth2 client niet geconfigureerd (google_oauth_credentials.json ontbreken).');
+    throw new Error('OAuth2 client niet geconfigureerd (google_oauth_credentials.json missen).');
   }
   if (fs.existsSync(TOKEN_PATH)) {
     try {
@@ -56,7 +48,7 @@ async function ensureAuthenticated() {
       oauth2Client.setCredentials(token);
       return;
     } catch (e) {
-      console.warn('Kon token.json niet lezen, opnieuw authenticeren...', e.message || e);
+      console.warn('Kon token.json niet lezen, open de URL om te autoriseren (zie console).', e.message || e);
     }
   }
   const authUrl = oauth2Client.generateAuthUrl({
@@ -86,13 +78,12 @@ const client = new Client({
 client.once('ready', async () => {
   console.log(`Bot online als ${client.user.tag}`);
 
-  // register slash commands (in jouw guilds / globally depending on setup)
+  // Register slash commands (guild-scoped is fastest for dev)
   try {
     const commands = [
       new SlashCommandBuilder().setName('order').setDescription('Log een order').addStringOption(option =>
         option.setName('order_id').setDescription('Het order ID van de bestelling').setRequired(true)),
       new SlashCommandBuilder().setName('helpbot').setDescription('Toon hulp voor bot commando’s'),
-      // PIA management commands
       new SlashCommandBuilder().setName('register').setDescription('Registreer en krijg een agent-token (start agent lokaal met de token)'),
       new SlashCommandBuilder().setName('getproxy').setDescription('Vraag een nieuwe socks5 proxy aan (gebruik token)').addStringOption(opt => opt.setName('token').setDescription('Je agent token').setRequired(true))
     ];
@@ -103,78 +94,88 @@ client.once('ready', async () => {
   }
 });
 
-// Handle commands (heet van jouw originele bot + nieuwe PIA commands)
+// --- Interaction handler (ROBUUST: deferReply + single-response safety) ---
 client.on('interactionCreate', async (interaction) => {
   try {
-    if (!interaction.isCommand()) return;
+    // Alleen slash chat-input commands
+    if (!interaction.isChatInputCommand?.()) return;
 
-    const { commandName, options } = interaction;
+    // Direct ACK sturen omdat sommige acties >3s kunnen duren
+    await interaction.deferReply({ ephemeral: true });
 
-    // bestaande order command
-    if (commandName === 'order') {
-      const orderId = options.getString('order_id');
+    const name = interaction.commandName;
+
+    // /order command (hield je al in de bot)
+    if (name === 'order') {
+      const orderId = interaction.options.getString('order_id');
       const worker = interaction.user.username;
       const date = new Date().toISOString();
 
       if (!orderId) {
-        await interaction.reply('Geef alstublieft een geldig order_id.');
+        await interaction.editReply('Geef alstublieft een geldig order_id.');
         return;
       }
 
       const values = [[orderId, worker, date]];
       try {
         await appendRows(values);
-        await interaction.reply(`Order ID ${orderId} is geregistreerd door ${worker} op ${date}.`);
+        await interaction.editReply(`Order ID ${orderId} is geregistreerd door ${worker} op ${date}.`);
       } catch (err) {
         console.error('Fout bij toevoegen aan sheet:', err);
-        await interaction.reply('Kon order niet opslaan in sheet. Check logs.');
+        await interaction.editReply('Kon order niet opslaan in sheet. Check logs.');
       }
       return;
     }
 
-    if (commandName === 'helpbot') {
-      await interaction.reply('Gebruik: /order <order_id>, /helpbot, /register, /getproxy <token>');
+    // /helpbot
+    if (name === 'helpbot') {
+      await interaction.editReply('Gebruik: /order <order_id>, /helpbot, /register, /getproxy <token>');
       return;
     }
 
-    // PIA: register -> create token for this discord user (returns token to start agent with)
-    if (commandName === 'register') {
-      await interaction.deferReply({ ephemeral: true });
+    // /register -> create token for this discord user via control-server
+    if (name === 'register') {
       const res = await createTokenForDiscordUser(interaction.user.id);
-      if (res.token) {
+      if (res && res.token) {
         await interaction.editReply({
           content:
             `Token aangemaakt. Start de agent op je machine met:\n\`\`\`\nAGENT_TOKEN=${res.token} node agent.js\n\`\`\`\nBewaar dit token veilig.`
         });
       } else {
-        await interaction.editReply({ content: `Kon token niet aanmaken: ${JSON.stringify(res)}` });
+        await interaction.editReply(`Kon token niet aanmaken: ${JSON.stringify(res)}`);
       }
       return;
     }
 
-    // PIA: getproxy (token)
-    if (commandName === 'getproxy') {
-      await interaction.deferReply({ ephemeral: true });
-      const token = options.getString('token', true);
-
-      // call control-server to assign proxy
+    // /getproxy <token>
+    if (name === 'getproxy') {
+      const token = interaction.options.getString('token', true);
       const r = await assignProxyByToken(token);
-      if (r.ok) {
-        await interaction.editReply({ content: 'Proxy opdracht verstuurd. Als je agent online is wordt je poort ge-update.' });
+      if (r && r.ok) {
+        await interaction.editReply('Proxy opdracht verstuurd. Als je agent online is wordt je poort ge-update.');
       } else {
-        await interaction.editReply({ content: `Fout: ${JSON.stringify(r)}` });
+        await interaction.editReply(`Fout: ${JSON.stringify(r)}`);
       }
       return;
     }
+
+    // onbekend commando
+    await interaction.editReply('Onbekend commando.');
   } catch (err) {
-    console.error('Fout in interactionCreate:', err);
-    if (!interaction.replied) {
-      try { await interaction.reply('Er is iets fout gegaan. Check bot console.'); } catch (_) {}
+    console.error('Fout in interactionCreate handler:', err);
+    try {
+      if (interaction.deferred || interaction.replied) {
+        await interaction.editReply('Er is een fout opgetreden. Check logs.');
+      } else {
+        await interaction.reply({ content: 'Er is een fout opgetreden. Check logs.', ephemeral: true });
+      }
+    } catch (e) {
+      console.error('Kon gebruiker niet informeren:', e);
     }
   }
 });
 
-// login safe (zoals in je oorspronkelijke bot)
+// login
 (async () => {
   try {
     await client.login(TOKEN);
@@ -184,9 +185,7 @@ client.on('interactionCreate', async (interaction) => {
   }
 })();
 
-// health server (houdt je huidige behavior)
-const http = require('http');
-const port = process.env.PORT || DEFAULT_CALLBACK_PORT;
-http.createServer((req, res) => res.end('ok')).listen(port, () => {
-  console.log('Health server listening on port', port);
+// health server (zodat Render / process managers weten dat de service up is)
+http.createServer((req, res) => res.end('ok')).listen(DEFAULT_CALLBACK_PORT, () => {
+  console.log('Health server listening on port', DEFAULT_CALLBACK_PORT);
 });
